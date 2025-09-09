@@ -1,7 +1,8 @@
-from typing import List, Dict, Set, Optional, Tuple
+from typing import List, Dict, Set, Optional, Tuple, Union
 import torch
 from transformers import PreTrainedTokenizer
 from transformers.generation.utils import DisjunctiveConstraint
+from transformers.generation.beam_constraints import Constraint
 
 
 class TrieNode:
@@ -96,15 +97,16 @@ class DocIDTrie:
 
 
 class TrieConstraint:
-    def __init__(self, tokenizer: PreTrainedTokenizer):
+    def __init__(self, tokenizer: PreTrainedTokenizer, max_length: int = 20):
         self.tokenizer = tokenizer
+        self.max_length = max_length
         self.trie = DocIDTrie(tokenizer)
         self._constraint = None
     
     def build_trie(self, valid_docids: List[str]):
         self.trie.clear()
         self.trie.add_docids(valid_docids)
-        self._constraint = DocIDTrieConstraint(self.trie)
+        self._constraint = DocIDTrieConstraint(self.trie, self.max_length)
     
     def get_constraint(self):
         if self._constraint is None:
@@ -127,11 +129,110 @@ class TrieConstraint:
         return continuations
 
 
-class DocIDTrieConstraint:
-    def __init__(self, trie: DocIDTrie):
+class DocIDTrieConstraint(Constraint):
+    def __init__(self, trie: DocIDTrie, max_length: int = 20):
         self.trie = trie
+        self.max_length = max_length
+        self.seqlen = max_length  # Required by HuggingFace Constraint base class
+        self.current_sequence = []
+        self.completed = False
+        
+    def advance(self) -> Union[int, List[int], None]:
+        """Return tokens that advance the constraint towards being fulfilled."""
+        if self.completed:
+            return None
+        
+        valid_tokens = self.trie.get_valid_next_tokens(self.current_sequence)
+        if not valid_tokens:
+            return None
+        
+        # Return the first valid token as default advancement
+        return valid_tokens[0] if len(valid_tokens) == 1 else valid_tokens
+    
+    def does_advance(self, token_id: int) -> bool:
+        """Check if the given token advances the constraint."""
+        if self.completed:
+            return False
+        
+        valid_tokens = self.trie.get_valid_next_tokens(self.current_sequence)
+        return token_id in valid_tokens
+    
+    def update(self, token_id: int) -> Tuple[bool, bool, bool]:
+        """Update constraint state with new token.
+        
+        Returns:
+            stepped: Whether constraint is closer to being fulfilled
+            completed: Whether constraint is fully satisfied  
+            reset: Whether progress was interrupted (need to start over)
+        """
+        if self.completed:
+            return False, True, False
+        
+        valid_tokens = self.trie.get_valid_next_tokens(self.current_sequence)
+        
+        if token_id in valid_tokens:
+            # Valid step forward
+            new_sequence = self.current_sequence + [token_id]
+            self.current_sequence = new_sequence
+            
+            # Check if this completes a valid DocID
+            is_complete = self.trie.is_complete_docid(new_sequence)
+            if is_complete:
+                self.completed = True
+                return True, True, False
+            
+            # Check if we can continue (valid prefix)
+            is_valid_prefix = self.trie.is_valid_prefix(new_sequence)
+            if is_valid_prefix:
+                return True, False, False
+            else:
+                # Dead end, need to reset
+                self.reset()
+                return False, False, True
+        else:
+            # Invalid token, reset
+            self.reset()
+            return False, False, True
+    
+    def reset(self):
+        """Reset constraint state."""
+        self.current_sequence = []
+        self.completed = False
+    
+    def remaining(self) -> int:
+        """Return number of steps remaining to complete constraint."""
+        if self.completed:
+            return 0
+        
+        # Estimate remaining steps (this is approximate)
+        current_length = len(self.current_sequence)
+        if current_length == 0:
+            # At least one token needed
+            return 1
+        
+        # Check if current sequence can lead to completion
+        valid_tokens = self.trie.get_valid_next_tokens(self.current_sequence)
+        if not valid_tokens:
+            return float('inf')  # Cannot be completed
+        
+        # Estimate based on minimum remaining tokens needed
+        # This is a heuristic - exact calculation would require tree traversal
+        return max(1, self.max_length - current_length)
+    
+    def copy(self, stateful=True):
+        """Create a copy of this constraint."""
+        new_constraint = DocIDTrieConstraint(self.trie, self.max_length)
+        if stateful:
+            new_constraint.current_sequence = self.current_sequence.copy()
+            new_constraint.completed = self.completed
+        else:
+            # Non-stateful copy - start fresh
+            new_constraint.current_sequence = []
+            new_constraint.completed = False
+        return new_constraint
     
     def __call__(self, batch_id: int, input_ids: torch.Tensor) -> torch.Tensor:
+        """Legacy call method for backwards compatibility."""
         current_sequence = input_ids.tolist()
         
         if not current_sequence:

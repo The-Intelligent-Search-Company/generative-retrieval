@@ -78,6 +78,8 @@ class GRData:
         }
     
     def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
         if self.dataset is None:
             raise AttributeError(f"No dataset loaded")
         return getattr(self.dataset, name)

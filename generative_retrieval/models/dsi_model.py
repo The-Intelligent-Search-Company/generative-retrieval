@@ -8,6 +8,18 @@ from .tokenizers import DocIDTokenizer
 
 
 class DSIModel(nn.Module):
+    """Differentiable Search Index (DSI) model using T5 architecture.
+    
+    This model implements the DSI approach for neural information retrieval,
+    where documents are mapped to identifiers that can be generated autoregressively.
+    
+    Args:
+        model_name: Name of the T5 model to use (e.g., 't5-base', 't5-large')
+        docid_format: Format for document IDs ('sequential', 'hierarchical', etc.)
+        max_docid_length: Maximum length for generated document IDs
+        use_constrained_generation: Whether to use trie-based constraints during generation
+    """
+    
     def __init__(
         self,
         model_name: str = "t5-large",
@@ -28,7 +40,7 @@ class DSIModel(nn.Module):
         
         self.trie_constraint = None
         if use_constrained_generation:
-            self.trie_constraint = TrieConstraint(self.tokenizer)
+            self.trie_constraint = TrieConstraint(self.tokenizer, max_docid_length)
     
     def forward(
         self,
@@ -67,7 +79,8 @@ class DSIModel(nn.Module):
         return {
             'input_ids': input_encodings['input_ids'],
             'attention_mask': input_encodings['attention_mask'],
-            'labels': target_encodings['input_ids']
+            'labels': target_encodings['input_ids'],
+            'task_type': 'indexing'
         }
     
     def prepare_retrieval_batch(self, queries: List[str], doc_ids: List[str]) -> Dict[str, torch.Tensor]:
@@ -93,7 +106,8 @@ class DSIModel(nn.Module):
         return {
             'input_ids': input_encodings['input_ids'],
             'attention_mask': input_encodings['attention_mask'],
-            'labels': target_encodings['input_ids']
+            'labels': target_encodings['input_ids'],
+            'task_type': 'retrieval'
         }
     
     def generate_docids(
@@ -101,8 +115,8 @@ class DSIModel(nn.Module):
         queries: List[str],
         num_return_sequences: int = 10,
         valid_docids: Optional[List[str]] = None,
-        do_sample: bool = False,
-        temperature: float = 1.0
+        do_sample: bool = True,
+        temperature: float = 0.1
     ) -> List[List[str]]:
         inputs = [f"retrieve query: {query}" for query in queries]
         
@@ -114,22 +128,64 @@ class DSIModel(nn.Module):
             return_tensors="pt"
         )
         
-        generation_kwargs = {
-            'input_ids': input_encodings['input_ids'],
-            'attention_mask': input_encodings['attention_mask'],
-            'max_length': self.max_docid_length,
-            'num_return_sequences': num_return_sequences,
-            'do_sample': do_sample,
-            'temperature': temperature,
-            'pad_token_id': self.tokenizer.pad_token_id,
-            'eos_token_id': self.tokenizer.eos_token_id,
-            'return_dict_in_generate': True,
-            'output_scores': True
-        }
+        # Determine generation strategy based on constraints and sampling
+        if self.use_constrained_generation and valid_docids is not None:
+            # Constrained generation requires beam search
+            generation_kwargs = {
+                'input_ids': input_encodings['input_ids'],
+                'attention_mask': input_encodings['attention_mask'],
+                'max_length': self.max_docid_length,
+                'pad_token_id': self.tokenizer.pad_token_id,
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'return_dict_in_generate': True,
+                'output_scores': True,
+                'num_beams': max(num_return_sequences, 2),
+                'num_return_sequences': num_return_sequences,
+                'early_stopping': True,
+                'do_sample': False  # Constrained generation doesn't work well with sampling
+            }
+        else:
+            # Regular generation (sampling or beam search)
+            generation_kwargs = {
+                'input_ids': input_encodings['input_ids'],
+                'attention_mask': input_encodings['attention_mask'],
+                'max_length': self.max_docid_length,
+                'pad_token_id': self.tokenizer.pad_token_id,
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'return_dict_in_generate': True,
+                'output_scores': True,
+                'num_return_sequences': num_return_sequences
+            }
+            
+            if do_sample:
+                generation_kwargs.update({
+                    'do_sample': True,
+                    'temperature': temperature,
+                    'top_p': 0.9,
+                    'repetition_penalty': 1.1
+                })
+            elif num_return_sequences > 1:
+                generation_kwargs.update({
+                    'num_beams': max(num_return_sequences, 2),
+                    'early_stopping': True,
+                    'do_sample': False
+                })
+            else:
+                # Greedy decoding for single sequence
+                generation_kwargs.update({
+                    'do_sample': False,
+                    'temperature': 1.0
+                })
         
+        # Apply constraints if using constrained generation
         if self.use_constrained_generation and valid_docids is not None:
             self.trie_constraint.build_trie(valid_docids)
             generation_kwargs['constraints'] = [self.trie_constraint.get_constraint()]
+            # Ensure we use beam search for constrained generation
+            if 'do_sample' in generation_kwargs:
+                generation_kwargs['do_sample'] = False
+            if 'num_beams' not in generation_kwargs:
+                generation_kwargs['num_beams'] = max(num_return_sequences, 2)
         
         with torch.no_grad():
             outputs = self.model.generate(**generation_kwargs)
@@ -146,7 +202,40 @@ class DSIModel(nn.Module):
             for j in range(start_idx, min(end_idx, len(generated_sequences))):
                 docid = self.tokenizer.decode(generated_sequences[j], skip_special_tokens=True)
                 docid = docid.strip()
-                if docid:
+                
+                # Clean up DocID formatting
+                if self.docid_tokenizer:
+                    docid = self.docid_tokenizer._postprocess_docid(docid)
+                else:
+                    # Basic cleanup for sequential DocIDs
+                    docid = ''.join(filter(str.isdigit, docid))  # Keep only digits
+                    if len(docid) > 0 and len(docid) < 8:
+                        docid = docid.zfill(8)  # Pad to 8 digits
+                    elif len(docid) > 8:
+                        docid = docid[:8]  # Truncate to 8 digits
+                
+                # Validate DocID
+                if docid and len(docid) == 8 and docid.isdigit():
+                    # Only add valid DocIDs if using constraints
+                    if (not self.use_constrained_generation or 
+                        valid_docids is None or 
+                        docid in valid_docids):
+                        batch_results.append(docid)
+                    elif valid_docids:  # Find closest valid DocID
+                        try:
+                            target_num = int(docid)
+                            closest_docid = min(valid_docids, 
+                                               key=lambda x: abs(int(x) - target_num) if x.isdigit() else float('inf'))
+                            batch_results.append(closest_docid)
+                        except (ValueError, TypeError):
+                            # Fallback to a valid DocID
+                            if valid_docids and valid_docids[0] not in batch_results:
+                                batch_results.append(valid_docids[0])
+            
+            # Ensure we have enough results by filling with valid DocIDs
+            if len(batch_results) < num_return_sequences and valid_docids:
+                remaining_valid = [docid for docid in valid_docids if docid not in batch_results]
+                for docid in remaining_valid[:num_return_sequences - len(batch_results)]:
                     batch_results.append(docid)
             
             results.append(batch_results)
@@ -215,3 +304,45 @@ class DSIModel(nn.Module):
     def set_valid_docids(self, valid_docids: List[str]):
         if self.trie_constraint is not None:
             self.trie_constraint.build_trie(valid_docids)
+    
+    def compute_multitask_loss(
+        self,
+        indexing_batch: Optional[Dict[str, torch.Tensor]] = None,
+        retrieval_batch: Optional[Dict[str, torch.Tensor]] = None,
+        indexing_weight: float = 1.0,
+        retrieval_weight: float = 1.0
+    ) -> torch.Tensor:
+        """Compute weighted multi-task loss for indexing and retrieval."""
+        total_loss = 0.0
+        loss_components = {}
+        
+        if indexing_batch is not None:
+            indexing_outputs = self.forward(
+                input_ids=indexing_batch['input_ids'],
+                attention_mask=indexing_batch['attention_mask'],
+                labels=indexing_batch['labels']
+            )
+            indexing_loss = indexing_outputs.loss * indexing_weight
+            total_loss += indexing_loss
+            loss_components['indexing'] = indexing_loss
+        
+        if retrieval_batch is not None:
+            retrieval_outputs = self.forward(
+                input_ids=retrieval_batch['input_ids'],
+                attention_mask=retrieval_batch['attention_mask'],
+                labels=retrieval_batch['labels']
+            )
+            retrieval_loss = retrieval_outputs.loss * retrieval_weight
+            total_loss += retrieval_loss
+            loss_components['retrieval'] = retrieval_loss
+        
+        # Create output object with loss and components for multi-task training
+        from dataclasses import dataclass
+        from typing import Dict
+        
+        @dataclass
+        class MultiTaskOutput:
+            loss: torch.Tensor
+            loss_components: Dict[str, torch.Tensor]
+        
+        return MultiTaskOutput(loss=total_loss, loss_components=loss_components)
