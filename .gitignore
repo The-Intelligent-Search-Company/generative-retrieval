@@ -209,3 +209,5 @@ __marimo__/
 
 # Dummy Files For Testing
 __test__.py
+
+outputs/
