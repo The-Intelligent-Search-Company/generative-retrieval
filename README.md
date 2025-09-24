@@ -53,7 +53,7 @@ The Generative Retrieval Library provides a complete framework for training, eva
 
 ```bash
 pip install torch transformers datasets
-git clone [[https://github.com/your-org/generative-retrieval.git](https://github.com/The-Intelligent-Search-Company/generative-retrieval.git)](https://github.com/The-Intelligent-Search-Company/generative-retrieval.git)
+git clone https://github.com/The-Intelligent-Search-Company/generative-retrieval.git
 cd generative-retrieval
 pip install -e .
 ```
