@@ -6,3 +6,7 @@ transformers>=4.20.0
 numpy>=1.21.0
 sentencepiece>=0.1.95
 protobuf>=3.20.0
+scikit-learn>=1.0.0
+tqdm>=4.65.0
+modal>=0.60.0
+sentence-transformers>=2.2.0
