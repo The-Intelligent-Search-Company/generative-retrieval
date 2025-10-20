@@ -2,7 +2,6 @@ from typing import List, Dict, Any, Optional, Union
 import torch
 import torch.nn as nn
 from transformers import T5ForConditionalGeneration, T5Tokenizer, T5Config
-from transformers.generation.utils import BeamSearchScorer
 from .constraints import TrieConstraint
 from .tokenizers import DocIDTokenizer
 

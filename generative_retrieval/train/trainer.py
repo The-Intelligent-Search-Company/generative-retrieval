@@ -346,6 +346,10 @@ class DSITrainer:
                     )
                     loss = outputs.loss
             
+            # Handle DataParallel returning vector of losses
+            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                loss = loss.mean()
+            
             if self.config.gradient_accumulation_steps > 1:
                 loss = loss / self.config.gradient_accumulation_steps
             
@@ -449,12 +453,17 @@ class DSITrainer:
                     labels=batch['labels']
                 )
                 
-                loss = outputs.loss.item()
-                eval_losses['total'] += loss
+                # Handle DataParallel returning vector of losses
+                loss = outputs.loss
+                if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                    loss = loss.mean()
+                
+                loss_value = loss.item()
+                eval_losses['total'] += loss_value
                 eval_counts['total'] += 1
                 
                 for task_type in batch['task_types']:
-                    eval_losses[task_type] += loss / len(batch['task_types'])
+                    eval_losses[task_type] += loss_value / len(batch['task_types'])
                     eval_counts[task_type] += 1
         
         avg_losses = {}
@@ -472,24 +481,31 @@ class DSITrainer:
         return avg_losses
     
     def _compute_retrieval_metrics(self) -> Dict[str, float]:
-        eval_dict = self.eval_data.to_dict()
-        train_dict = self.train_data.to_dict()
-        queries = eval_dict['query'][:self.config.max_eval_samples]
-        ground_truth_docids = eval_dict['doc_id'][:self.config.max_eval_samples]
-        # Use train_data DocIDs as valid set (this is what model learned)
-        valid_docids = list(set(train_dict['doc_id']))
-        
-        # Set valid DocIDs for constrained generation
-        self.model.set_valid_docids(valid_docids)
-        
-        metrics = self.model.evaluate_retrieval(
-            queries=queries,
-            ground_truth_docids=ground_truth_docids,
-            valid_docids=valid_docids,
-            k_values=self.config.eval_k_values
-        )
-        
-        return {f'eval_{k}': v for k, v in metrics.items()}
+        try:
+            eval_dict = self.eval_data.to_dict()
+            train_dict = self.train_data.to_dict()
+            queries = eval_dict['query'][:self.config.max_eval_samples]
+            ground_truth_docids = eval_dict['doc_id'][:self.config.max_eval_samples]
+            # Use train_data DocIDs as valid set (this is what model learned)
+            valid_docids = list(set(train_dict['doc_id']))
+            
+            # Set valid DocIDs for constrained generation
+            self.model.set_valid_docids(valid_docids)
+            
+            metrics = self.model.evaluate_retrieval(
+                queries=queries,
+                ground_truth_docids=ground_truth_docids,
+                valid_docids=valid_docids,
+                k_values=self.config.eval_k_values
+            )
+            
+            return {f'eval_{k}': v for k, v in metrics.items()}
+        except Exception as e:
+            self.logger.warning(f"Retrieval metrics computation failed: {e}")
+            import traceback
+            self.logger.warning(f"Traceback: {traceback.format_exc()}")
+            # Return default metrics to prevent training from failing
+            return {f'eval_hits@{k}': 0.0 for k in self.config.eval_k_values}
     
     def train(self) -> Dict[str, List[float]]:
         self.logger.info("Starting training...")

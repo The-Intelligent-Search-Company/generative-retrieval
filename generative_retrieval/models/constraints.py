@@ -1,8 +1,11 @@
 from typing import List, Dict, Set, Optional, Tuple, Union
 import torch
 from transformers import PreTrainedTokenizer
-from transformers.generation.utils import DisjunctiveConstraint
-from transformers.generation.beam_constraints import Constraint
+
+try:
+    from transformers.generation.beam_constraints import Constraint
+except ImportError:
+    from transformers.generation.stopping_criteria import StoppingCriteria as Constraint
 
 
 class TrieNode:
@@ -233,6 +236,7 @@ class DocIDTrieConstraint(Constraint):
     
     def __call__(self, batch_id: int, input_ids: torch.Tensor) -> torch.Tensor:
         """Legacy call method for backwards compatibility."""
+        device = input_ids.device
         current_sequence = input_ids.tolist()
         
         if not current_sequence:
@@ -241,9 +245,9 @@ class DocIDTrieConstraint(Constraint):
             valid_tokens = self.trie.get_valid_next_tokens(current_sequence)
         
         if not valid_tokens:
-            return torch.tensor([], dtype=torch.long)
+            return torch.tensor([], dtype=torch.long, device=device)
         
-        return torch.tensor(valid_tokens, dtype=torch.long)
+        return torch.tensor(valid_tokens, dtype=torch.long, device=device)
 
 
 class BeamSearchConstraint:
